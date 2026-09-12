@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Flappy Roblox</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #1b2430;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  #game-wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    background: linear-gradient(#7ec8e3 0%, #bfe8f0 70%, #dff3d8 100%);
+    display: block;
+    touch-action: none;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  #hint {
+    position: fixed;
+    bottom: env(safe-area-inset-bottom, 12px);
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: #cfd8e3;
+    font: 12px -apple-system, system-ui, sans-serif;
+    opacity: 0.7;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="game-wrap">
+  <canvas id="game"></canvas>
+</div>
+<div id="hint">點擊 / 按空白鍵 起飛</div>
+
+<script>
+(function () {
+  const LOGICAL_W = 400;
+  const LOGICAL_H = 640;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function fitCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const scale = Math.min(window.innerWidth / LOGICAL_W, window.innerHeight / LOGICAL_H);
+    const cssW = LOGICAL_W * scale;
+    const cssH = LOGICAL_H * scale;
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = LOGICAL_W * dpr;
+    canvas.height = LOGICAL_H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  const GRAVITY = 1500;
+  const FLAP_VELOCITY = -430;
+  const GROUND_H = 90;
+  // 用圓形判定碰撞，半徑不受人物傾斜角度影響，避免俯衝時判定框比視覺輪廓大
+  const PLAYER_RADIUS = 15;
+
+  // 難度每 10 分晉升一階，最高到 999 分（第 99 階）封頂，避免無限加速到無法遊玩
+  const DIFFICULTY_SCORE_STEP = 10;
+  const MAX_DIFFICULTY_TIER = Math.floor(999 / DIFFICULTY_SCORE_STEP);
+
+  const PIPE_SPEED_BASE = 160;
+  const PIPE_SPEED_PER_TIER = 4;
+  const PIPE_SPEED_MAX = 320;
+
+  const PIPE_GAP_BASE = 170;
+  const PIPE_GAP_PER_TIER = 1.4;
+  const PIPE_GAP_MIN = 120;
+
+  const PIPE_INTERVAL_BASE = 1350;
+  const PIPE_INTERVAL_PER_TIER = 8;
+  const PIPE_INTERVAL_MIN = 950;
+
+  const MONSTER_UNLOCK_SCORE = 10;
+  const MONSTER_CHECK_INTERVAL = 2200;
+  const MONSTER_MAX_ON_SCREEN = 2;
+  const MONSTER_CHANCE_BASE = 0.35;
+  const MONSTER_CHANCE_PER_TIER = 0.01;
+  const MONSTER_CHANCE_MAX = 0.6;
+  const MONSTER_SPEED_MIN_BASE = 100;
+  const MONSTER_SPEED_MAX_BASE = 260;
+  const MONSTER_SPEED_MIN_PER_TIER = 3;
+  const MONSTER_SPEED_MAX_PER_TIER = 4;
+  const MONSTER_SPEED_MIN_CAP = 220;
+  const MONSTER_SPEED_MAX_CAP = 420;
+
+  function difficultyTier(s) {
+    return Math.min(MAX_DIFFICULTY_TIER, Math.floor(s / DIFFICULTY_SCORE_STEP));
+  }
+  function currentPipeSpeed(s) {
+    return Math.min(PIPE_SPEED_MAX, PIPE_SPEED_BASE + difficultyTier(s) * PIPE_SPEED_PER_TIER);
+  }
+  function currentPipeGap(s) {
+    return Math.max(PIPE_GAP_MIN, PIPE_GAP_BASE - difficultyTier(s) * PIPE_GAP_PER_TIER);
+  }
+  function currentPipeInterval(s) {
+    return Math.max(PIPE_INTERVAL_MIN, PIPE_INTERVAL_BASE - difficultyTier(s) * PIPE_INTERVAL_PER_TIER);
+  }
+  function currentMonsterChance(s) {
+    return Math.min(MONSTER_CHANCE_MAX, MONSTER_CHANCE_BASE + difficultyTier(s) * MONSTER_CHANCE_PER_TIER);
+  }
+  function currentMonsterSpeedRange(s) {
+    const tier = difficultyTier(s);
+    return {
+      min: Math.min(MONSTER_SPEED_MIN_CAP, MONSTER_SPEED_MIN_BASE + tier * MONSTER_SPEED_MIN_PER_TIER),
+      max: Math.min(MONSTER_SPEED_MAX_CAP, MONSTER_SPEED_MAX_BASE + tier * MONSTER_SPEED_MAX_PER_TIER)
+    };
+  }
+
+  let state = 'ready';
+  let player, pipes, monsters, spawnTimer, monsterTimer, score, best, elapsedMs, lastTime;
+
+  best = Number(localStorage.getItem('flappyRobloxBest') || 0);
+
+  function resetGame() {
+    player = {
+      x: 110,
+      y: LOGICAL_H / 2,
+      vy: 0,
+      angle: 0
+    };
+    pipes = [];
+    monsters = [];
+    spawnTimer = 0;
+    monsterTimer = 0;
+    score = 0;
+    elapsedMs = 0;
+  }
+  resetGame();
+
+  function spawnPipe() {
+    const gap = currentPipeGap(score);
+    const margin = 60;
+    const gapCenter = margin + Math.random() * (LOGICAL_H - GROUND_H - margin * 2 - gap) + gap / 2;
+    pipes.push({
+      x: LOGICAL_W + 40,
+      w: 62,
+      gap: gap,
+      speed: currentPipeSpeed(score),
+      gapCenter: gapCenter,
+      passed: false
+    });
+  }
+
+  function spawnMonster() {
+    const range = currentMonsterSpeedRange(score);
+    const margin = 70;
+    const y = margin + Math.random() * (LOGICAL_H - GROUND_H - margin * 2);
+    monsters.push({
+      x: LOGICAL_W + 50,
+      y: y,
+      speed: range.min + Math.random() * (range.max - range.min),
+      w: 40,
+      h: 34
+    });
+  }
+
+  function flap() {
+    if (state === 'ready') {
+      state = 'playing';
+      lastTime = performance.now();
+      requestAnimationFrame(loop);
+    }
+    if (state === 'playing') {
+      player.vy = FLAP_VELOCITY;
+    } else if (state === 'gameover') {
+      resetGame();
+      state = 'ready';
+    }
+  }
+
+  function circleRectOverlap(cx, cy, r, rx, ry, rw, rh) {
+    const closestX = Math.max(rx, Math.min(cx, rx + rw));
+    const closestY = Math.max(ry, Math.min(cy, ry + rh));
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return dx * dx + dy * dy < r * r;
+  }
+
+  function update(dt) {
+    if (state !== 'playing') return;
+
+    elapsedMs += dt * 1000;
+    player.vy += GRAVITY * dt;
+    player.y += player.vy * dt;
+    player.angle = Math.max(-0.5, Math.min(1.1, player.vy / 500));
+
+    spawnTimer += dt * 1000;
+    if (spawnTimer >= currentPipeInterval(score)) {
+      spawnTimer = 0;
+      spawnPipe();
+    }
+
+    monsterTimer += dt * 1000;
+    if (monsterTimer >= MONSTER_CHECK_INTERVAL) {
+      monsterTimer = 0;
+      if (score >= MONSTER_UNLOCK_SCORE &&
+          monsters.length < MONSTER_MAX_ON_SCREEN &&
+          Math.random() < currentMonsterChance(score)) {
+        spawnMonster();
+      }
+    }
+
+    for (let i = pipes.length - 1; i >= 0; i--) {
+      const p = pipes[i];
+      p.x -= p.speed * dt;
+
+      const topH = p.gapCenter - p.gap / 2;
+      const bottomY = p.gapCenter + p.gap / 2;
+      const bottomH = (LOGICAL_H - GROUND_H) - bottomY;
+
+      if (circleRectOverlap(player.x, player.y, PLAYER_RADIUS, p.x, 0, p.w, topH) ||
+          circleRectOverlap(player.x, player.y, PLAYER_RADIUS, p.x, bottomY, p.w, bottomH)) {
+        gameOver();
+      }
+
+      if (!p.passed && p.x + p.w < player.x) {
+        p.passed = true;
+        score++;
+      }
+
+      if (p.x + p.w < -10) {
+        pipes.splice(i, 1);
+      }
+    }
+
+    for (let i = monsters.length - 1; i >= 0; i--) {
+      const m = monsters[i];
+      m.x -= m.speed * dt;
+
+      if (circleRectOverlap(player.x, player.y, PLAYER_RADIUS, m.x - m.w / 2, m.y - m.h / 2, m.w, m.h)) {
+        gameOver();
+      }
+
+      if (m.x + m.w / 2 < -40) {
+        monsters.splice(i, 1);
+      }
+    }
+
+    if (player.y - PLAYER_RADIUS < 0) {
+      player.y = PLAYER_RADIUS;
+      player.vy = 0;
+    }
+    if (player.y + PLAYER_RADIUS > LOGICAL_H - GROUND_H) {
+      player.y = LOGICAL_H - GROUND_H - PLAYER_RADIUS;
+      gameOver();
+    }
+  }
+
+  function gameOver() {
+    if (state !== 'playing') return;
+    state = 'gameover';
+    if (score > best) {
+      best = score;
+      localStorage.setItem('flappyRobloxBest', String(best));
+    }
+  }
+
+  function drawBackground() {
+    const t = elapsedMs / 1000;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    for (let i = 0; i < 4; i++) {
+      const cx = ((i * 140 + 60) - (t * 20) % 560 + 560) % (LOGICAL_W + 160) - 80;
+      const cy = 70 + i * 40 % 90;
+      drawCloud(cx, cy);
+    }
+  }
+
+  function drawCloud(cx, cy) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+    ctx.arc(cx + 20, cy - 8, 16, 0, Math.PI * 2);
+    ctx.arc(cx + 38, cy, 18, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawPipes() {
+    pipes.forEach(p => {
+      const topH = p.gapCenter - p.gap / 2;
+      const bottomY = p.gapCenter + p.gap / 2;
+      const bottomH = (LOGICAL_H - GROUND_H) - bottomY;
+
+      ctx.fillStyle = '#3fae4f';
+      ctx.fillRect(p.x, 0, p.w, topH);
+      ctx.fillRect(p.x, bottomY, p.w, bottomH);
+
+      ctx.fillStyle = '#2f8d3d';
+      ctx.fillRect(p.x - 4, topH - 22, p.w + 8, 22);
+      ctx.fillRect(p.x - 4, bottomY, p.w + 8, 22);
+    });
+  }
+
+  // 怪物：從畫面右側隨機速度飛向左側，第 10 分後才會出現
+  function drawMonsters() {
+    monsters.forEach(m => {
+      ctx.save();
+      ctx.translate(m.x, m.y);
+
+      ctx.fillStyle = '#7a3b5e';
+      ctx.strokeStyle = '#141414';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, m.w / 2, m.h / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      [-6, 6].forEach(cx => {
+        ctx.beginPath();
+        ctx.moveTo(cx - 4, -m.h / 2 + 4);
+        ctx.lineTo(cx, -m.h / 2 - 9);
+        ctx.lineTo(cx + 4, -m.h / 2 + 4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      });
+
+      ctx.fillStyle = '#ffffff';
+      [-8, 8].forEach(cx => {
+        ctx.beginPath();
+        ctx.ellipse(cx, -2, 4, 5, 0, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.fillStyle = '#141414';
+      ctx.beginPath();
+      ctx.ellipse(-9, -1, 1.8, 2.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(9, -1, 1.8, 2.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#141414';
+      ctx.lineWidth = 2.4;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-13, -9);
+      ctx.lineTo(-4, -6);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(13, -9);
+      ctx.lineTo(4, -6);
+      ctx.stroke();
+
+      ctx.restore();
+    });
+  }
+
+  function drawGround() {
+    ctx.fillStyle = '#d9b872';
+    ctx.fillRect(0, LOGICAL_H - GROUND_H, LOGICAL_W, GROUND_H);
+    ctx.fillStyle = '#6fae4a';
+    ctx.fillRect(0, LOGICAL_H - GROUND_H, LOGICAL_W, 14);
+  }
+
+  // 方塊人角色繪製 (自製造型，非 Roblox 官方配色/模型)
+  function drawPlayer() {
+    const p = player;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.angle);
+    ctx.scale(0.85, 0.85);
+
+    ctx.strokeStyle = 'rgba(154,165,177,0.55)';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    [ [-20,4,-34,4], [-22,11,-38,11], [-19,-3,-31,-3] ].forEach(([x1,y1,x2,y2]) => {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    });
+
+    function rrect(x, y, w, h, r, color, rot) {
+      ctx.save();
+      if (rot) {
+        ctx.translate(x + w/2, y + h/2);
+        ctx.rotate(rot);
+        ctx.translate(-(x + w/2), -(y + h/2));
+      }
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 側身、方形迷你造型：手臂後掃像振翅
+    rrect(-15, -8, 9, 18, 2, '#e8b075', 0.9);
+    // 後腳
+    rrect(-10, 10, 8, 14, 2, '#3b4a63', 0.5);
+    rrect(-13, 21, 11, 5, 1, '#1f2937', 0.5);
+    // 前腳
+    rrect(3, 11, 8, 14, 2, '#3b4a63', -0.15);
+    rrect(3, 23, 11, 5, 1, '#1f2937', -0.15);
+    // 方形軀幹
+    rrect(-13, -9, 25, 21, 2, '#2f9e8f');
+    // 方形頭部（偏向飛行方向，露出單側側臉）
+    rrect(5, -27, 19, 19, 2, '#e8b075');
+    // 髮塊
+    rrect(3, -29, 23, 6, 1.5, '#4b3621');
+    // 側臉單眼
+    ctx.fillStyle = '#1f2937';
+    ctx.fillRect(17, -19, 4, 5);
+
+    ctx.restore();
+  }
+
+  function drawScore() {
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 4;
+    ctx.font = 'bold 44px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.strokeText(String(score), LOGICAL_W / 2, 90);
+    ctx.fillText(String(score), LOGICAL_W / 2, 90);
+  }
+
+  function drawOverlay() {
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+
+    if (state === 'ready') {
+      ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
+      ctx.fillText('Flappy Roblox', LOGICAL_W / 2, LOGICAL_H / 2 - 40);
+      ctx.font = '18px -apple-system, system-ui, sans-serif';
+      ctx.fillText('點一下畫面開始', LOGICAL_W / 2, LOGICAL_H / 2);
+      if (best > 0) {
+        ctx.font = '15px -apple-system, system-ui, sans-serif';
+        ctx.fillStyle = '#cfd8e3';
+        ctx.fillText('最佳紀錄：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 32);
+      }
+    } else if (state === 'gameover') {
+      ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
+      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
+      ctx.font = '20px -apple-system, system-ui, sans-serif';
+      ctx.fillText('分數：' + score, LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.fillText('最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
+      ctx.font = '16px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#cfd8e3';
+      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + 60);
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+    drawBackground();
+    drawPipes();
+    drawMonsters();
+    drawPlayer();
+    drawGround();
+    drawScore();
+    if (state !== 'playing') drawOverlay();
+  }
+
+  function loop(now) {
+    const dt = Math.min((now - lastTime) / 1000, 1 / 30);
+    lastTime = now;
+    update(dt);
+    render();
+    if (state === 'playing') {
+      requestAnimationFrame(loop);
+    } else {
+      render();
+    }
+  }
+
+  function handleInput(e) {
+    e.preventDefault();
+    flap();
+    if (state !== 'playing') render();
+  }
+
+  canvas.addEventListener('touchstart', handleInput, { passive: false });
+  canvas.addEventListener('mousedown', handleInput);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      flap();
+      if (state !== 'playing') render();
+    }
+  });
+  document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+
+  render();
+})();
+</script>
+</body>
+</html>
