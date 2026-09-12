@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Roblox Runner</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #3a2a1e;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  #game-wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    background: linear-gradient(#ffb877 0%, #ffd9a0 55%, #ffe9c2 100%);
+    display: block;
+    touch-action: none;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  #hint {
+    position: fixed;
+    bottom: env(safe-area-inset-bottom, 12px);
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: #fff3e0;
+    font: 12px -apple-system, system-ui, sans-serif;
+    opacity: 0.8;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="game-wrap">
+  <canvas id="game"></canvas>
+</div>
+<div id="hint">點擊 / 按空白鍵 跳躍</div>
+<iframe name="score_hidden_iframe" style="display:none;" title="score logging (hidden)"></iframe>
+
+<script>
+(function () {
+  const LOGICAL_W = 400;
+  const LOGICAL_H = 640;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function fitCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const scale = Math.min(window.innerWidth / LOGICAL_W, window.innerHeight / LOGICAL_H);
+    const cssW = LOGICAL_W * scale;
+    const cssH = LOGICAL_H * scale;
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = LOGICAL_W * dpr;
+    canvas.height = LOGICAL_H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  const GROUND_H = 90;
+  const GROUND_Y = LOGICAL_H - GROUND_H;
+  const PLAYER_X = 90;
+  const GRAVITY = 2000;
+  const JUMP_VELOCITY = -660;
+
+  // 難度每 300 分晉升一階，速度跟障礙物間距都會跟著變化，並封頂避免玩到無法反應
+  const DIFFICULTY_SCORE_STEP = 300;
+  const MAX_DIFFICULTY_TIER = 12;
+
+  const SPEED_BASE = 230;
+  const SPEED_PER_TIER = 14;
+  const SPEED_MAX = 420;
+
+  const GAP_BASE = 1500;
+  const GAP_PER_TIER = 55;
+  const GAP_MIN = 850;
+
+  function difficultyTier(s) {
+    return Math.min(MAX_DIFFICULTY_TIER, Math.floor(s / DIFFICULTY_SCORE_STEP));
+  }
+  function currentSpeed(s) {
+    return Math.min(SPEED_MAX, SPEED_BASE + difficultyTier(s) * SPEED_PER_TIER);
+  }
+  function currentGap(s) {
+    return Math.max(GAP_MIN, GAP_BASE - difficultyTier(s) * GAP_PER_TIER);
+  }
+
+  let state = 'ready'; // ready | playing | gameover
+  let player, obstacles, spawnTimer, score, best, elapsedMs, lastTime, groundOffset;
+
+  best = Number(localStorage.getItem('robloxRunnerBest') || 0);
+
+  // ---- global high score (all devices) — disabled until a Google Form/sheet is wired up ----
+  const SCORE_FORM_ID = 'REPLACE_WITH_FORM_ID';
+  const SCORE_FORM_ENTRY = 'REPLACE_WITH_ENTRY_ID';
+  const SCORE_CSV_URL = 'REPLACE_WITH_PUBLISHED_CSV_URL';
+  const GLOBAL_SCORE_ENABLED = false;
+  let globalBest = null;
+
+  function submitScore(s) {
+    if (!GLOBAL_SCORE_ENABLED) return;
+    try {
+      const form = document.createElement('form');
+      form.action = 'https://docs.google.com/forms/d/e/' + SCORE_FORM_ID + '/formResponse';
+      form.method = 'POST';
+      form.target = 'score_hidden_iframe';
+      form.style.display = 'none';
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = SCORE_FORM_ENTRY;
+      input.value = String(s);
+      form.appendChild(input);
+      document.body.appendChild(form);
+      form.submit();
+      setTimeout(function () { form.remove(); }, 1000);
+    } catch (e) { /* best-effort; never block gameplay on this */ }
+  }
+
+  function fetchGlobalBest(thisRoundScore) {
+    if (!GLOBAL_SCORE_ENABLED) return;
+    thisRoundScore = thisRoundScore || 0;
+    fetch(SCORE_CSV_URL, { cache: 'no-store' })
+      .then(function (res) { return res.text(); })
+      .then(function (text) {
+        const lines = text.trim().split('\n');
+        let max = 0;
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i].split(',');
+          const val = parseInt(cols[cols.length - 1], 10);
+          if (!isNaN(val) && val > max) { max = val; }
+        }
+        globalBest = Math.max(max, thisRoundScore);
+        if (state === 'gameover' || state === 'ready') { render(); }
+      })
+      .catch(function () { /* leave globalBest null; UI shows a fallback */ });
+  }
+
+  function resetGame() {
+    player = { y: GROUND_Y, vy: 0, onGround: true, runPhase: 0 };
+    obstacles = [];
+    spawnTimer = 0;
+    score = 0;
+    elapsedMs = 0;
+    groundOffset = 0;
+  }
+  resetGame();
+
+  function spawnObstacle() {
+    const kinds = [
+      { w: 24, h: 34 },
+      { w: 30, h: 46 },
+      { w: 36, h: 26 },
+      { w: 20, h: 58 }
+    ];
+    const k = kinds[Math.floor(Math.random() * kinds.length)];
+    obstacles.push({
+      x: LOGICAL_W + 30,
+      w: k.w,
+      h: k.h,
+      passed: false
+    });
+  }
+
+  function jump() {
+    if (state === 'ready') {
+      state = 'playing';
+      lastTime = performance.now();
+      requestAnimationFrame(loop);
+    }
+    if (state === 'playing') {
+      if (player.onGround) {
+        player.vy = JUMP_VELOCITY;
+        player.onGround = false;
+      }
+    } else if (state === 'gameover') {
+      resetGame();
+      state = 'ready';
+    }
+  }
+
+  function rectOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  function update(dt) {
+    if (state !== 'playing') return;
+
+    elapsedMs += dt * 1000;
+    const speed = currentSpeed(score);
+    groundOffset = (groundOffset + speed * dt) % 40;
+
+    player.vy += GRAVITY * dt;
+    player.y += player.vy * dt;
+    if (player.y >= GROUND_Y) {
+      player.y = GROUND_Y;
+      player.vy = 0;
+      player.onGround = true;
+    }
+    if (player.onGround) { player.runPhase += dt * 10; }
+
+    score += dt * 60; // distance-based score, ~60/sec at tier 0
+
+    spawnTimer += dt * 1000;
+    if (spawnTimer >= currentGap(score)) {
+      spawnTimer = 0;
+      spawnObstacle();
+    }
+
+    const playerBox = { x: PLAYER_X - 11, y: player.y - 40, w: 22, h: 40 };
+
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+      const o = obstacles[i];
+      o.x -= speed * dt;
+
+      if (rectOverlap(playerBox.x, playerBox.y, playerBox.w, playerBox.h, o.x, GROUND_Y - o.h, o.w, o.h)) {
+        gameOver();
+      }
+
+      if (o.x + o.w < -20) { obstacles.splice(i, 1); }
+    }
+  }
+
+  function gameOver() {
+    if (state !== 'playing') return;
+    state = 'gameover';
+    const finalScore = Math.floor(score);
+    if (finalScore > best) {
+      best = finalScore;
+      localStorage.setItem('robloxRunnerBest', String(best));
+    }
+    submitScore(finalScore);
+    globalBest = null;
+    fetchGlobalBest(finalScore);
+  }
+
+  function drawBackground() {
+    const t = elapsedMs / 1000;
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    for (let i = 0; i < 4; i++) {
+      const cx = ((i * 140 + 60) - (t * 15) % 560 + 560) % (LOGICAL_W + 160) - 80;
+      const cy = 60 + (i * 45) % 90;
+      drawCloud(cx, cy);
+    }
+  }
+  function drawCloud(cx, cy) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+    ctx.arc(cx + 18, cy - 6, 14, 0, Math.PI * 2);
+    ctx.arc(cx + 34, cy, 16, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawGround() {
+    ctx.fillStyle = '#c98a4b';
+    ctx.fillRect(0, GROUND_Y, LOGICAL_W, GROUND_H);
+    ctx.fillStyle = '#a86a34';
+    ctx.fillRect(0, GROUND_Y, LOGICAL_W, 10);
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    for (let x = -40 - groundOffset; x < LOGICAL_W; x += 40) {
+      ctx.fillRect(x, GROUND_Y + 18, 22, 5);
+    }
+  }
+
+  function drawObstacles() {
+    obstacles.forEach(function (o) {
+      const y = GROUND_Y - o.h;
+      ctx.fillStyle = '#3f9e5c';
+      ctx.beginPath();
+      ctx.moveTo(o.x + 4, y + o.h);
+      ctx.arcTo(o.x, y + o.h, o.x, y, 4);
+      ctx.arcTo(o.x, y, o.x + o.w, y, 4);
+      ctx.arcTo(o.x + o.w, y, o.x + o.w, y + o.h, 4);
+      ctx.arcTo(o.x + o.w, y + o.h, o.x, y + o.h, 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fillRect(o.x, y, o.w, 5);
+    });
+  }
+
+  // 方塊人角色（跟 Flappy Roblox 同一個原創造型，非官方 Roblox 素材）
+  function drawPlayer() {
+    const p = player;
+    ctx.save();
+    ctx.translate(PLAYER_X, p.y);
+    ctx.scale(0.85, 0.85);
+
+    function rrect(x, y, w, h, r, color, rot) {
+      ctx.save();
+      if (rot) {
+        ctx.translate(x + w / 2, y + h / 2);
+        ctx.rotate(rot);
+        ctx.translate(-(x + w / 2), -(y + h / 2));
+      }
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    const legSwing = p.onGround ? Math.sin(p.runPhase) * 0.5 : 0;
+    const tuck = p.onGround ? 0 : -0.5; // legs tuck up while airborne
+
+    // 後腳
+    rrect(-9, -30, 8, 14, 2, '#3b4a63', 0.5 + legSwing + tuck);
+    rrect(-12, -19, 11, 5, 1, '#1f2937', 0.5 + legSwing + tuck);
+    // 前腳
+    rrect(2, -30, 8, 14, 2, '#3b4a63', -0.5 - legSwing + tuck);
+    rrect(2, -19, 11, 5, 1, '#1f2937', -0.5 - legSwing + tuck);
+    // 手臂
+    rrect(-15, -49, 9, 18, 2, '#e8b075', p.onGround ? -legSwing : -0.6);
+    // 方形軀幹
+    rrect(-13, -50, 25, 21, 2, '#2f9e8f');
+    // 方形頭部
+    rrect(5, -68, 19, 19, 2, '#e8b075');
+    // 髮塊
+    rrect(3, -70, 23, 6, 1.5, '#4b3621');
+    // 側臉單眼
+    ctx.fillStyle = '#1f2937';
+    ctx.fillRect(17, -60, 4, 5);
+
+    ctx.restore();
+  }
+
+  function drawHud() {
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    ctx.lineWidth = 4;
+    ctx.font = 'bold 26px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    const s = String(Math.floor(score));
+    ctx.strokeText(s, LOGICAL_W - 16, 44);
+    ctx.fillText(s, LOGICAL_W - 16, 44);
+  }
+
+  function drawOverlay() {
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+
+    if (state === 'ready') {
+      ctx.font = 'bold 28px -apple-system, system-ui, sans-serif';
+      ctx.fillText('Roblox Runner', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
+      ctx.font = '18px -apple-system, system-ui, sans-serif';
+      ctx.fillText('點一下開始，跳過障礙物', LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.font = '15px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#ffe9c2';
+      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
+      if (GLOBAL_SCORE_ENABLED) {
+        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 46);
+      }
+    } else if (state === 'gameover') {
+      const finalScore = Math.floor(score);
+      ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
+      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 60);
+      ctx.font = '20px -apple-system, system-ui, sans-serif';
+      ctx.fillText('分數：' + finalScore, LOGICAL_W / 2, LOGICAL_H / 2 - 22);
+      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 8);
+      if (GLOBAL_SCORE_ENABLED) {
+        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 38);
+      }
+      ctx.font = '16px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#ffe9c2';
+      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + (GLOBAL_SCORE_ENABLED ? 76 : 56));
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+    drawBackground();
+    drawObstacles();
+    drawPlayer();
+    drawGround();
+    drawHud();
+    if (state !== 'playing') drawOverlay();
+  }
+
+  function loop(now) {
+    const dt = Math.min((now - lastTime) / 1000, 1 / 30);
+    lastTime = now;
+    update(dt);
+    render();
+    if (state === 'playing') {
+      requestAnimationFrame(loop);
+    } else {
+      render();
+    }
+  }
+
+  function handleInput(e) {
+    e.preventDefault();
+    jump();
+    if (state !== 'playing') render();
+  }
+
+  canvas.addEventListener('touchstart', handleInput, { passive: false });
+  canvas.addEventListener('mousedown', handleInput);
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      jump();
+      if (state !== 'playing') render();
+    }
+  });
+  document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+
+  render();
+  fetchGlobalBest();
+})();
+</script>
+</body>
+</html>
