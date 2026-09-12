@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Breakout</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #14102b;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  #game-wrap {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    background: linear-gradient(#1c1640 0%, #2a1f57 100%);
+    display: block;
+    touch-action: none;
+    max-width: 100%;
+    max-height: 100%;
+  }
+  #hint {
+    position: fixed;
+    bottom: env(safe-area-inset-bottom, 12px);
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: #cfd8e3;
+    font: 12px -apple-system, system-ui, sans-serif;
+    opacity: 0.7;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="game-wrap">
+  <canvas id="game"></canvas>
+</div>
+<div id="hint">拖曳移動擋板 / 點擊發球</div>
+<iframe name="score_hidden_iframe" style="display:none;" title="score logging (hidden)"></iframe>
+
+<script>
+(function () {
+  const LOGICAL_W = 400;
+  const LOGICAL_H = 640;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  function fitCanvas() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const scale = Math.min(window.innerWidth / LOGICAL_W, window.innerHeight / LOGICAL_H);
+    const cssW = LOGICAL_W * scale;
+    const cssH = LOGICAL_H * scale;
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = LOGICAL_W * dpr;
+    canvas.height = LOGICAL_H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', fitCanvas);
+  fitCanvas();
+
+  const PADDLE_W = 74;
+  const PADDLE_H = 12;
+  const PADDLE_Y = LOGICAL_H - 46;
+  const BALL_R = 7;
+  const BALL_SPEED_BASE = 390;
+  const BALL_SPEED_PER_LEVEL = 27;
+  const BALL_SPEED_MAX = 690;
+
+  const BRICK_ROWS = 5;
+  const BRICK_COLS = 7;
+  const BRICK_TOP = 64;
+  const BRICK_GAP = 5;
+  const BRICK_SIDE_MARGIN = 14;
+  const BRICK_W = (LOGICAL_W - BRICK_SIDE_MARGIN * 2 - BRICK_GAP * (BRICK_COLS - 1)) / BRICK_COLS;
+  const BRICK_H = 18;
+  const ROW_COLORS = ['#ff5da2', '#ff9f5a', '#ffd85e', '#4de3c1', '#5ab4ff'];
+  const ROW_POINTS = [50, 40, 30, 20, 10];
+
+  const START_LIVES = 3;
+
+  let state = 'ready'; // ready | serve | playing | life-lost | gameover
+  let paddle, ball, bricks, score, level, lives, best, elapsedMs, lastTime;
+  let paddleTargetX;
+
+  best = Number(localStorage.getItem('breakoutBest') || 0);
+
+  // ---- global high score (all devices), via a Google Form (write) + published sheet CSV (read) ----
+  const SCORE_FORM_ID = 'REPLACE_WITH_FORM_ID';
+  const SCORE_FORM_ENTRY = 'REPLACE_WITH_ENTRY_ID';
+  const SCORE_CSV_URL = 'REPLACE_WITH_PUBLISHED_CSV_URL';
+  const GLOBAL_SCORE_ENABLED = false; // flip to true once the form/sheet above are filled in
+  let globalBest = null;
+
+  function submitScore(s) {
+    if (!GLOBAL_SCORE_ENABLED) return;
+    try {
+      const form = document.createElement('form');
+      form.action = 'https://docs.google.com/forms/d/e/' + SCORE_FORM_ID + '/formResponse';
+      form.method = 'POST';
+      form.target = 'score_hidden_iframe';
+      form.style.display = 'none';
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = SCORE_FORM_ENTRY;
+      input.value = String(s);
+      form.appendChild(input);
+      document.body.appendChild(form);
+      form.submit();
+      setTimeout(function () { form.remove(); }, 1000);
+    } catch (e) { /* best-effort; never block gameplay on this */ }
+  }
+
+  function fetchGlobalBest(thisRoundScore) {
+    if (!GLOBAL_SCORE_ENABLED) return;
+    thisRoundScore = thisRoundScore || 0;
+    fetch(SCORE_CSV_URL, { cache: 'no-store' })
+      .then(function (res) { return res.text(); })
+      .then(function (text) {
+        const lines = text.trim().split('\n');
+        let max = 0;
+        for (let i = 1; i < lines.length; i++) {
+          const cols = lines[i].split(',');
+          const val = parseInt(cols[cols.length - 1], 10);
+          if (!isNaN(val) && val > max) { max = val; }
+        }
+        globalBest = Math.max(max, thisRoundScore);
+        if (state === 'gameover' || state === 'ready') { render(); }
+      })
+      .catch(function () { /* leave globalBest null; UI shows a fallback */ });
+  }
+
+  // Each level gets a random layout: the left half is randomized per row, then
+  // mirrored to the right half so the result still looks tidy and intentional
+  // instead of pure noise. Density (60%-100% filled) varies per level too.
+  function buildBricks() {
+    const arr = [];
+    const density = 0.6 + Math.random() * 0.4;
+    const halfCols = Math.ceil(BRICK_COLS / 2);
+
+    for (let r = 0; r < BRICK_ROWS; r++) {
+      const rowAlive = [];
+      for (let c = 0; c < halfCols; c++) {
+        rowAlive[c] = Math.random() < density;
+      }
+      for (let c = halfCols; c < BRICK_COLS; c++) {
+        rowAlive[c] = rowAlive[BRICK_COLS - 1 - c];
+      }
+      for (let c = 0; c < BRICK_COLS; c++) {
+        if (!rowAlive[c]) continue;
+        arr.push({
+          x: BRICK_SIDE_MARGIN + c * (BRICK_W + BRICK_GAP),
+          y: BRICK_TOP + r * (BRICK_H + BRICK_GAP),
+          w: BRICK_W,
+          h: BRICK_H,
+          row: r,
+          alive: true
+        });
+      }
+    }
+
+    if (arr.length === 0) {
+      arr.push({ x: BRICK_SIDE_MARGIN, y: BRICK_TOP, w: BRICK_W, h: BRICK_H, row: 0, alive: true });
+    }
+    return arr;
+  }
+
+  function ballSpeedForLevel(lv) {
+    return Math.min(BALL_SPEED_MAX, BALL_SPEED_BASE + (lv - 1) * BALL_SPEED_PER_LEVEL);
+  }
+
+  function resetBallOnPaddle() {
+    ball = {
+      x: paddle.x + paddle.w / 2,
+      y: PADDLE_Y - BALL_R - 2,
+      vx: 0,
+      vy: 0
+    };
+  }
+
+  function newGame() {
+    score = 0;
+    level = 1;
+    lives = START_LIVES;
+    elapsedMs = 0;
+    paddle = { x: (LOGICAL_W - PADDLE_W) / 2, w: PADDLE_W };
+    paddleTargetX = paddle.x;
+    bricks = buildBricks();
+    resetBallOnPaddle();
+  }
+  newGame();
+
+  function launchBall() {
+    const speed = ballSpeedForLevel(level);
+    const angle = -Math.PI / 2 + (Math.random() * 0.6 - 0.3); // mostly upward, slight random angle
+    ball.vx = Math.cos(angle) * speed;
+    ball.vy = Math.sin(angle) * speed;
+    state = 'playing';
+  }
+
+  function handleTap() {
+    if (state === 'ready' || state === 'serve' || state === 'life-lost') {
+      if (state === 'ready') {
+        lastTime = performance.now();
+        requestAnimationFrame(loop);
+      }
+      launchBall();
+    } else if (state === 'gameover') {
+      newGame();
+      state = 'ready';
+      render();
+    }
+  }
+
+  function movePaddleTo(clientX) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = LOGICAL_W / rect.width;
+    const logicalX = (clientX - rect.left) * scaleX;
+    paddleTargetX = Math.max(0, Math.min(LOGICAL_W - paddle.w, logicalX - paddle.w / 2));
+  }
+
+  function circleRectOverlap(cx, cy, r, rx, ry, rw, rh) {
+    const closestX = Math.max(rx, Math.min(cx, rx + rw));
+    const closestY = Math.max(ry, Math.min(cy, ry + rh));
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return dx * dx + dy * dy < r * r;
+  }
+
+  function update(dt) {
+    // paddle smoothly follows the touch/mouse target
+    paddle.x += (paddleTargetX - paddle.x) * Math.min(1, dt * 18);
+
+    if (state !== 'playing') {
+      if (state === 'ready' || state === 'life-lost') {
+        ball.x = paddle.x + paddle.w / 2;
+      }
+      return;
+    }
+
+    elapsedMs += dt * 1000;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    if (ball.x - BALL_R < 0) { ball.x = BALL_R; ball.vx *= -1; }
+    if (ball.x + BALL_R > LOGICAL_W) { ball.x = LOGICAL_W - BALL_R; ball.vx *= -1; }
+    if (ball.y - BALL_R < 0) { ball.y = BALL_R; ball.vy *= -1; }
+
+    // paddle collision: bounce angle depends on where the ball hits
+    if (ball.vy > 0 && circleRectOverlap(ball.x, ball.y, BALL_R, paddle.x, PADDLE_Y, paddle.w, PADDLE_H)) {
+      const hit = (ball.x - (paddle.x + paddle.w / 2)) / (paddle.w / 2); // -1..1
+      const speed = Math.hypot(ball.vx, ball.vy);
+      const angle = -Math.PI / 2 + hit * (Math.PI / 3);
+      ball.vx = Math.cos(angle) * speed;
+      ball.vy = Math.sin(angle) * speed;
+      ball.y = PADDLE_Y - BALL_R - 0.5;
+    }
+
+    // brick collisions
+    for (let i = 0; i < bricks.length; i++) {
+      const b = bricks[i];
+      if (!b.alive) continue;
+      if (circleRectOverlap(ball.x, ball.y, BALL_R, b.x, b.y, b.w, b.h)) {
+        b.alive = false;
+        score += ROW_POINTS[b.row] || 10;
+
+        const overlapLeft = (ball.x + BALL_R) - b.x;
+        const overlapRight = (b.x + b.w) - (ball.x - BALL_R);
+        const overlapTop = (ball.y + BALL_R) - b.y;
+        const overlapBottom = (b.y + b.h) - (ball.y - BALL_R);
+        const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
+        if (minOverlap === overlapLeft || minOverlap === overlapRight) { ball.vx *= -1; }
+        else { ball.vy *= -1; }
+        break;
+      }
+    }
+
+    if (bricks.every(function (b) { return !b.alive; })) {
+      level++;
+      bricks = buildBricks();
+      resetBallOnPaddle();
+      state = 'life-lost'; // reuse "tap to serve" flow between levels
+    }
+
+    if (ball.y - BALL_R > LOGICAL_H) {
+      lives--;
+      if (lives <= 0) {
+        gameOver();
+      } else {
+        resetBallOnPaddle();
+        state = 'life-lost';
+      }
+    }
+  }
+
+  function gameOver() {
+    state = 'gameover';
+    if (score > best) {
+      best = score;
+      localStorage.setItem('breakoutBest', String(best));
+    }
+    submitScore(score);
+    globalBest = null;
+    fetchGlobalBest(score);
+  }
+
+  function drawBricks() {
+    bricks.forEach(function (b) {
+      if (!b.alive) return;
+      ctx.fillStyle = ROW_COLORS[b.row] || '#ffffff';
+      ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.fillRect(b.x, b.y, b.w, 4);
+    });
+  }
+
+  function drawPaddle() {
+    ctx.fillStyle = '#f2eaff';
+    ctx.beginPath();
+    ctx.moveTo(paddle.x + 6, PADDLE_Y);
+    ctx.arcTo(paddle.x + paddle.w, PADDLE_Y, paddle.x + paddle.w, PADDLE_Y + PADDLE_H, 6);
+    ctx.arcTo(paddle.x + paddle.w, PADDLE_Y + PADDLE_H, paddle.x, PADDLE_Y + PADDLE_H, 6);
+    ctx.arcTo(paddle.x, PADDLE_Y + PADDLE_H, paddle.x, PADDLE_Y, 6);
+    ctx.arcTo(paddle.x, PADDLE_Y, paddle.x + paddle.w, PADDLE_Y, 6);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawBall() {
+    ctx.fillStyle = '#ffd85e';
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawHud() {
+    ctx.fillStyle = '#f2eaff';
+    ctx.font = 'bold 18px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('分數 ' + score, 14, 30);
+    ctx.textAlign = 'right';
+    ctx.fillText('關卡 ' + level, LOGICAL_W - 14, 30);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff5da2';
+    let hearts = '';
+    for (let i = 0; i < lives; i++) { hearts += '♥'; }
+    ctx.fillText(hearts, LOGICAL_W / 2, 30);
+  }
+
+  function drawOverlay() {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+
+    if (state === 'ready') {
+      ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
+      ctx.fillText('Breakout', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
+      ctx.font = '18px -apple-system, system-ui, sans-serif';
+      ctx.fillText('點一下發球開始', LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.font = '15px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#cfd8e3';
+      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
+      if (GLOBAL_SCORE_ENABLED) {
+        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 46);
+      }
+    } else if (state === 'life-lost') {
+      ctx.font = 'bold 22px -apple-system, system-ui, sans-serif';
+      ctx.fillText(lives < START_LIVES ? '再點一下繼續' : '過關！第 ' + level + ' 關', LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.font = '16px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#cfd8e3';
+      ctx.fillText('點一下發球', LOGICAL_W / 2, LOGICAL_H / 2 + 20);
+    } else if (state === 'gameover') {
+      ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
+      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 60);
+      ctx.font = '20px -apple-system, system-ui, sans-serif';
+      ctx.fillText('分數：' + score, LOGICAL_W / 2, LOGICAL_H / 2 - 22);
+      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 8);
+      if (GLOBAL_SCORE_ENABLED) {
+        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 38);
+      }
+      ctx.font = '16px -apple-system, system-ui, sans-serif';
+      ctx.fillStyle = '#cfd8e3';
+      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + (GLOBAL_SCORE_ENABLED ? 76 : 56));
+    }
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+    drawBricks();
+    drawPaddle();
+    drawBall();
+    drawHud();
+    if (state !== 'playing') drawOverlay();
+  }
+
+  function loop(now) {
+    const dt = Math.min((now - lastTime) / 1000, 1 / 30);
+    lastTime = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function handlePointerMove(e) {
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    movePaddleTo(clientX);
+  }
+  function handlePointerDown(e) {
+    e.preventDefault();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    movePaddleTo(clientX);
+    handleTap();
+  }
+
+  canvas.addEventListener('mousedown', handlePointerDown);
+  canvas.addEventListener('mousemove', handlePointerMove);
+  canvas.addEventListener('touchstart', handlePointerDown, { passive: false });
+  canvas.addEventListener('touchmove', function (e) { e.preventDefault(); handlePointerMove(e); }, { passive: false });
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space') { e.preventDefault(); handleTap(); }
+    if (e.code === 'ArrowLeft') { paddleTargetX = Math.max(0, paddle.x - 40); }
+    if (e.code === 'ArrowRight') { paddleTargetX = Math.min(LOGICAL_W - paddle.w, paddle.x + 40); }
+  });
+
+  render();
+  fetchGlobalBest();
+})();
+</script>
+</body>
+</html>
