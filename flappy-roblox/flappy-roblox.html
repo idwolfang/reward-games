@@ -50,7 +50,6 @@
   <canvas id="game"></canvas>
 </div>
 <div id="hint">點擊 / 按空白鍵 起飛</div>
-<iframe name="score_hidden_iframe" style="display:none;" title="score logging (hidden)"></iframe>
 
 <script>
 (function () {
@@ -136,48 +135,6 @@
   let player, pipes, monsters, spawnTimer, monsterTimer, score, best, elapsedMs, lastTime;
 
   best = Number(localStorage.getItem('flappyRobloxBest') || 0);
-
-  // ---- global high score (all devices), via a Google Form (write) + published sheet CSV (read) ----
-  const SCORE_FORM_ID = '1FAIpQLSeJchSTJLRZtvhcvIdiVEgWsvp5Aq8PTE_q95r9mE8D3OH2AA';
-  const SCORE_FORM_ENTRY = 'entry.1229584762';
-  const SCORE_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTMK-v6OVS65hbZ99a0vYnrTNblDjbCQGaM1soHE2sMI22_QIF6g13gB4dCmq62GQa7Gl40w3albNdh/pub?output=csv';
-  let globalBest = null; // null = still loading
-
-  function submitScore(s) {
-    try {
-      const form = document.createElement('form');
-      form.action = 'https://docs.google.com/forms/d/e/' + SCORE_FORM_ID + '/formResponse';
-      form.method = 'POST';
-      form.target = 'score_hidden_iframe';
-      form.style.display = 'none';
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = SCORE_FORM_ENTRY;
-      input.value = String(s);
-      form.appendChild(input);
-      document.body.appendChild(form);
-      form.submit();
-      setTimeout(function () { form.remove(); }, 1000);
-    } catch (e) { /* best-effort; never block gameplay on this */ }
-  }
-
-  function fetchGlobalBest(thisRoundScore) {
-    thisRoundScore = thisRoundScore || 0;
-    fetch(SCORE_CSV_URL, { cache: 'no-store' })
-      .then(function (res) { return res.text(); })
-      .then(function (text) {
-        const lines = text.trim().split('\n');
-        let max = 0;
-        for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(',');
-          const val = parseInt(cols[cols.length - 1], 10);
-          if (!isNaN(val) && val > max) { max = val; }
-        }
-        globalBest = Math.max(max, thisRoundScore);
-        if (state === 'gameover' || state === 'ready') { render(); }
-      })
-      .catch(function () { /* leave globalBest null; UI shows a fallback */ });
-  }
 
   function resetGame() {
     player = {
@@ -321,9 +278,6 @@
       best = score;
       localStorage.setItem('flappyRobloxBest', String(best));
     }
-    submitScore(score);
-    globalBest = null;
-    fetchGlobalBest(score);
   }
 
   function drawBackground() {
@@ -498,23 +452,23 @@
 
     if (state === 'ready') {
       ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
-      ctx.fillText('Flappy Roblox', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
+      ctx.fillText('Flappy Roblox', LOGICAL_W / 2, LOGICAL_H / 2 - 40);
       ctx.font = '18px -apple-system, system-ui, sans-serif';
-      ctx.fillText('點一下畫面開始', LOGICAL_W / 2, LOGICAL_H / 2 - 10);
-      ctx.font = '15px -apple-system, system-ui, sans-serif';
-      ctx.fillStyle = '#cfd8e3';
-      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
-      ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 46);
+      ctx.fillText('點一下畫面開始', LOGICAL_W / 2, LOGICAL_H / 2);
+      if (best > 0) {
+        ctx.font = '15px -apple-system, system-ui, sans-serif';
+        ctx.fillStyle = '#cfd8e3';
+        ctx.fillText('最佳紀錄：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 32);
+      }
     } else if (state === 'gameover') {
       ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
-      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 60);
+      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
       ctx.font = '20px -apple-system, system-ui, sans-serif';
-      ctx.fillText('分數：' + score, LOGICAL_W / 2, LOGICAL_H / 2 - 22);
-      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 8);
-      ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 38);
+      ctx.fillText('分數：' + score, LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.fillText('最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
       ctx.font = '16px -apple-system, system-ui, sans-serif';
       ctx.fillStyle = '#cfd8e3';
-      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + 76);
+      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + 60);
     }
   }
 
@@ -559,7 +513,6 @@
   document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
 
   render();
-  fetchGlobalBest();
 })();
 </script>
 </body>

@@ -50,7 +50,6 @@
   <canvas id="game"></canvas>
 </div>
 <div id="hint">點擊 / 按空白鍵 跳躍</div>
-<iframe name="score_hidden_iframe" style="display:none;" title="score logging (hidden)"></iframe>
 
 <script>
 (function () {
@@ -106,51 +105,6 @@
   let player, obstacles, spawnTimer, score, best, elapsedMs, lastTime, groundOffset;
 
   best = Number(localStorage.getItem('robloxRunnerBest') || 0);
-
-  // ---- global high score (all devices) — disabled until a Google Form/sheet is wired up ----
-  const SCORE_FORM_ID = 'REPLACE_WITH_FORM_ID';
-  const SCORE_FORM_ENTRY = 'REPLACE_WITH_ENTRY_ID';
-  const SCORE_CSV_URL = 'REPLACE_WITH_PUBLISHED_CSV_URL';
-  const GLOBAL_SCORE_ENABLED = false;
-  let globalBest = null;
-
-  function submitScore(s) {
-    if (!GLOBAL_SCORE_ENABLED) return;
-    try {
-      const form = document.createElement('form');
-      form.action = 'https://docs.google.com/forms/d/e/' + SCORE_FORM_ID + '/formResponse';
-      form.method = 'POST';
-      form.target = 'score_hidden_iframe';
-      form.style.display = 'none';
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = SCORE_FORM_ENTRY;
-      input.value = String(s);
-      form.appendChild(input);
-      document.body.appendChild(form);
-      form.submit();
-      setTimeout(function () { form.remove(); }, 1000);
-    } catch (e) { /* best-effort; never block gameplay on this */ }
-  }
-
-  function fetchGlobalBest(thisRoundScore) {
-    if (!GLOBAL_SCORE_ENABLED) return;
-    thisRoundScore = thisRoundScore || 0;
-    fetch(SCORE_CSV_URL, { cache: 'no-store' })
-      .then(function (res) { return res.text(); })
-      .then(function (text) {
-        const lines = text.trim().split('\n');
-        let max = 0;
-        for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(',');
-          const val = parseInt(cols[cols.length - 1], 10);
-          if (!isNaN(val) && val > max) { max = val; }
-        }
-        globalBest = Math.max(max, thisRoundScore);
-        if (state === 'gameover' || state === 'ready') { render(); }
-      })
-      .catch(function () { /* leave globalBest null; UI shows a fallback */ });
-  }
 
   function resetGame() {
     player = { y: GROUND_Y, vy: 0, onGround: true, runPhase: 0 };
@@ -245,9 +199,6 @@
       best = finalScore;
       localStorage.setItem('robloxRunnerBest', String(best));
     }
-    submitScore(finalScore);
-    globalBest = null;
-    fetchGlobalBest(finalScore);
   }
 
   function drawBackground() {
@@ -364,28 +315,24 @@
 
     if (state === 'ready') {
       ctx.font = 'bold 28px -apple-system, system-ui, sans-serif';
-      ctx.fillText('Roblox Runner', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
+      ctx.fillText('Roblox Runner', LOGICAL_W / 2, LOGICAL_H / 2 - 40);
       ctx.font = '18px -apple-system, system-ui, sans-serif';
-      ctx.fillText('點一下開始，跳過障礙物', LOGICAL_W / 2, LOGICAL_H / 2 - 10);
-      ctx.font = '15px -apple-system, system-ui, sans-serif';
-      ctx.fillStyle = '#ffe9c2';
-      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
-      if (GLOBAL_SCORE_ENABLED) {
-        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 46);
+      ctx.fillText('點一下開始，跳過障礙物', LOGICAL_W / 2, LOGICAL_H / 2);
+      if (best > 0) {
+        ctx.font = '15px -apple-system, system-ui, sans-serif';
+        ctx.fillStyle = '#ffe9c2';
+        ctx.fillText('最佳紀錄：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 32);
       }
     } else if (state === 'gameover') {
       const finalScore = Math.floor(score);
       ctx.font = 'bold 30px -apple-system, system-ui, sans-serif';
-      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 60);
+      ctx.fillText('遊戲結束', LOGICAL_W / 2, LOGICAL_H / 2 - 50);
       ctx.font = '20px -apple-system, system-ui, sans-serif';
-      ctx.fillText('分數：' + finalScore, LOGICAL_W / 2, LOGICAL_H / 2 - 22);
-      ctx.fillText('這台裝置最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 8);
-      if (GLOBAL_SCORE_ENABLED) {
-        ctx.fillText('全部最高：' + (globalBest === null ? '讀取中...' : globalBest), LOGICAL_W / 2, LOGICAL_H / 2 + 38);
-      }
+      ctx.fillText('分數：' + finalScore, LOGICAL_W / 2, LOGICAL_H / 2 - 10);
+      ctx.fillText('最佳：' + best, LOGICAL_W / 2, LOGICAL_H / 2 + 22);
       ctx.font = '16px -apple-system, system-ui, sans-serif';
       ctx.fillStyle = '#ffe9c2';
-      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + (GLOBAL_SCORE_ENABLED ? 76 : 56));
+      ctx.fillText('再點一下重新開始', LOGICAL_W / 2, LOGICAL_H / 2 + 60);
     }
   }
 
@@ -429,7 +376,6 @@
   document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
 
   render();
-  fetchGlobalBest();
 })();
 </script>
 </body>
