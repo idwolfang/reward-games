@@ -73,7 +73,7 @@
   window.addEventListener('resize', fitCanvas);
   fitCanvas();
 
-  const GROUND_H = 90;
+  const GROUND_H = 102;
   const GROUND_Y = LOGICAL_H - GROUND_H;
   const PLAYER_X = 90;
   const GRAVITY = 2000;
@@ -101,8 +101,13 @@
     return Math.max(GAP_MIN, GAP_BASE - difficultyTier(s) * GAP_PER_TIER);
   }
 
+  // 過 1000 分後，偶爾會混入一隻可愛版怪獸（原創造型，跟障礙物一樣用跳的閃避）
+  const MONSTER_UNLOCK_SCORE = 1000;
+  const MONSTER_CHECK_INTERVAL = 2500;
+  const MONSTER_CHANCE = 0.4;
+
   let state = 'ready'; // ready | playing | gameover
-  let player, obstacles, spawnTimer, score, best, elapsedMs, lastTime, groundOffset;
+  let player, obstacles, spawnTimer, monsterTimer, score, best, elapsedMs, lastTime, groundOffset;
 
   best = Number(localStorage.getItem('robloxRunnerBest') || 0);
 
@@ -110,6 +115,7 @@
     player = { y: GROUND_Y, vy: 0, onGround: true, runPhase: 0 };
     obstacles = [];
     spawnTimer = 0;
+    monsterTimer = 0;
     score = 0;
     elapsedMs = 0;
     groundOffset = 0;
@@ -129,6 +135,16 @@
       w: k.w,
       h: k.h,
       passed: false
+    });
+  }
+
+  function spawnMonster() {
+    obstacles.push({
+      x: LOGICAL_W + 40,
+      w: 54,
+      h: 52,
+      passed: false,
+      kind: 'monster'
     });
   }
 
@@ -175,6 +191,14 @@
     if (spawnTimer >= currentGap(score)) {
       spawnTimer = 0;
       spawnObstacle();
+    }
+
+    if (score >= MONSTER_UNLOCK_SCORE) {
+      monsterTimer += dt * 1000;
+      if (monsterTimer >= MONSTER_CHECK_INTERVAL) {
+        monsterTimer = 0;
+        if (Math.random() < MONSTER_CHANCE) { spawnMonster(); }
+      }
     }
 
     const playerBox = { x: PLAYER_X - 11, y: player.y - 40, w: 22, h: 40 };
@@ -231,6 +255,7 @@
 
   function drawObstacles() {
     obstacles.forEach(function (o) {
+      if (o.kind === 'monster') { drawMonster(o); return; }
       const y = GROUND_Y - o.h;
       ctx.fillStyle = '#3f9e5c';
       ctx.beginPath();
@@ -244,6 +269,60 @@
       ctx.fillStyle = 'rgba(255,255,255,0.25)';
       ctx.fillRect(o.x, y, o.w, 5);
     });
+  }
+
+  // 可愛版哥吉拉風格怪獸（原創造型，非官方哥吉拉外觀），過 1000 分後偶爾出現
+  function drawMonster(o) {
+    const half = o.w / 2, halfH = o.h / 2;
+    const cx = o.x + half;
+    const cy = GROUND_Y - halfH;
+
+    function rrect(x, y, w, h, r, color) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // 尾巴
+    rrect(-half - 10, halfH - 16, 14, 10, 3, '#3f9e5c');
+    // 後腳、前腳
+    rrect(-half + 4, halfH - 12, 11, 14, 2, '#2f7d47');
+    rrect(half - 15, halfH - 12, 11, 14, 2, '#2f7d47');
+    // 身體
+    rrect(-half + 2, -halfH + 12, o.w - 4, halfH, 9, '#4db56a');
+    // 背刺（呼應經典輪廓的三角背鰭，原創簡化版）
+    ctx.fillStyle = '#2f7d47';
+    [-half * 0.35, -half * 0.05, half * 0.25].forEach(function (dx) {
+      ctx.beginPath();
+      ctx.moveTo(dx - 6, -halfH + 12);
+      ctx.lineTo(dx, -halfH - 8);
+      ctx.lineTo(dx + 6, -halfH + 12);
+      ctx.closePath();
+      ctx.fill();
+    });
+    // 手臂
+    rrect(-half + 6, -2, 9, 12, 2, '#4db56a');
+    // 頭
+    rrect(half - 24, -halfH - 4, 26, 24, 7, '#4db56a');
+    // 可愛大眼睛
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(half - 9, -halfH + 8, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#1f2937';
+    ctx.beginPath(); ctx.arc(half - 8, -halfH + 8, 2.4, 0, Math.PI * 2); ctx.fill();
+    // 小鼻孔
+    ctx.fillStyle = '#2f7d47';
+    ctx.beginPath(); ctx.arc(half, -halfH + 15, 1.4, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
   }
 
   // 方塊人角色（跟 Flappy Roblox 同一個原創造型，非官方 Roblox 素材）
